@@ -101,11 +101,38 @@ def _prepare_scenario_batch(
     return batches
 
 
-def _train_streaming_model(
-    model: STGCN,
+def _cache_scenario_batches(
     scenario_bundles: Sequence[ScenarioBundle],
     window_size: int,
     window_batch_size: int,
+    device: torch.device,
+) -> List[Dict[str, object]]:
+    """Materialize all scenario sliding windows once before training starts."""
+
+    cached_batches: List[Dict[str, object]] = []
+    for bundle in scenario_bundles:
+        scenario_batches = [
+            (x.float().to(device), y.float().to(device))
+            for x, y in iter_sequence_batches(
+                bundle.signal.features,
+                bundle.signal.targets,
+                window_size=window_size,
+                batch_size=window_batch_size,
+            )
+        ]
+        cached_batches.append(
+            {
+                "scenario_name": bundle.scenario_name,
+                "scenario_dir": str(bundle.metadata.get("scenario_dir", "")),
+                "batches": scenario_batches,
+            }
+        )
+    return cached_batches
+
+
+def _train_streaming_model(
+    model: STGCN,
+    cached_scenario_batches: Sequence[Dict[str, object]],
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     epochs: int = 30,
@@ -113,15 +140,15 @@ def _train_streaming_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = nn.MSELoss()
     history: List[float] = []
-    scenario_count = max(1, len(scenario_bundles))
+    scenario_count = max(1, len(cached_scenario_batches))
 
     model.train()
     for epoch in range(epochs):
         optimizer.zero_grad(set_to_none=True)
         epoch_losses: List[float] = []
 
-        for bundle in scenario_bundles:
-            scenario_batches = _prepare_scenario_batch(bundle, window_size=window_size, window_batch_size=window_batch_size)
+        for scenario_cache in cached_scenario_batches:
+            scenario_batches = scenario_cache["batches"]
             scenario_loss_total = 0.0
             scenario_batch_count = 0
             for x_batch, y_batch in scenario_batches:
@@ -132,10 +159,6 @@ def _train_streaming_model(
                 scenario_batch_count += 1
                 del x_batch, y_batch, prediction, loss
             epoch_losses.append(scenario_loss_total / max(1, scenario_batch_count))
-            del scenario_batches
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         optimizer.step()
         epoch_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
@@ -148,9 +171,7 @@ def _train_streaming_model(
 @torch.no_grad()
 def _evaluate_streaming_model(
     model: STGCN,
-    scenario_bundles: Sequence[ScenarioBundle],
-    window_size: int,
-    window_batch_size: int,
+    cached_scenario_batches: Sequence[Dict[str, object]],
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
 ) -> Tuple[List[Dict[str, object]], List[np.ndarray]]:
@@ -158,8 +179,8 @@ def _evaluate_streaming_model(
     scenario_metrics: List[Dict[str, object]] = []
     score_curves: List[np.ndarray] = []
 
-    for bundle in scenario_bundles:
-        scenario_batches = _prepare_scenario_batch(bundle, window_size=window_size, window_batch_size=window_batch_size)
+    for scenario_cache in cached_scenario_batches:
+        scenario_batches = scenario_cache["batches"]
         batch_scores: List[np.ndarray] = []
         mean_curve_parts: List[np.ndarray] = []
         for x_batch, y_batch in scenario_batches:
@@ -172,8 +193,8 @@ def _evaluate_streaming_model(
         mean_curve = np.concatenate(mean_curve_parts, axis=0) if mean_curve_parts else np.empty((0,), dtype=np.float32)
         scenario_metrics.append(
             {
-                "scenario_name": bundle.scenario_name,
-                "scenario_dir": str(bundle.metadata.get("scenario_dir", "")),
+                "scenario_name": scenario_cache["scenario_name"],
+                "scenario_dir": scenario_cache["scenario_dir"],
                 "mean_score": float(scores_array.mean()) if scores_array.size else 0.0,
                 "max_score": float(scores_array.max()) if scores_array.size else 0.0,
                 "num_windows": int(scores_array.shape[0]) if scores_array.ndim > 0 else 0,
@@ -557,23 +578,26 @@ def run_pipeline(
         dropout=0.1,
     )
 
-    edge_index = torch.tensor(first_signal.edge_index, dtype=torch.long)
-    edge_weight = torch.tensor(first_signal.edge_weight, dtype=torch.float32)
-
-    loss_history = _train_streaming_model(
-        stgcn,
+    model_device = next(stgcn.parameters()).device
+    edge_index = torch.tensor(first_signal.edge_index, dtype=torch.long, device=model_device)
+    edge_weight = torch.tensor(first_signal.edge_weight, dtype=torch.float32, device=model_device)
+    cached_scenario_batches = _cache_scenario_batches(
         scenario_bundles=scenario_bundles,
         window_size=window_size,
         window_batch_size=window_batch_size,
+        device=model_device,
+    )
+
+    loss_history = _train_streaming_model(
+        stgcn,
+        cached_scenario_batches=cached_scenario_batches,
         edge_index=edge_index,
         edge_weight=edge_weight,
         epochs=epochs,
     )
     scenario_metrics, score_curves = _evaluate_streaming_model(
         stgcn,
-        scenario_bundles=scenario_bundles,
-        window_size=window_size,
-        window_batch_size=window_batch_size,
+        cached_scenario_batches=cached_scenario_batches,
         edge_index=edge_index,
         edge_weight=edge_weight,
     )
