@@ -49,7 +49,8 @@ class SpatialGraphConvolution(nn.Module):
         # x: [batch, nodes, features]
         adjacency = adjacency.contiguous()
         x = x.contiguous()
-        propagated = torch.stack([adjacency.matmul(sample) for sample in x], dim=0)
+        # Vectorized batch propagation: [nodes, nodes] x [batch, nodes, features] -> [batch, nodes, features]
+        propagated = torch.einsum("ij,bjf->bif", adjacency, x)
         out = self.linear(propagated)
         out = self.norm(out)
         return torch.relu(self.dropout(out))
@@ -112,6 +113,30 @@ class STGCN(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_channels, output_channels),
         )
+        self._cached_adjacency: Optional[Tensor] = None
+        self._cached_adjacency_signature: Optional[Tuple[int, int, Tuple[int, ...], Tuple[int, ...], str, Optional[int]]] = None
+
+    @staticmethod
+    def _edge_signature(edge_index: Tensor, edge_weight: Optional[Tensor], device: torch.device) -> Tuple[int, int, Tuple[int, ...], Tuple[int, ...], str, Optional[int]]:
+        edge_weight_ptr = -1 if edge_weight is None else int(edge_weight.data_ptr())
+        edge_weight_shape = tuple(edge_weight.shape) if edge_weight is not None else ()
+        return (
+            int(edge_index.data_ptr()),
+            edge_weight_ptr,
+            tuple(edge_index.shape),
+            edge_weight_shape,
+            device.type,
+            device.index,
+        )
+
+    def _get_cached_adjacency(self, edge_index: Tensor, edge_weight: Optional[Tensor], num_nodes: int, device: torch.device) -> Tensor:
+        signature = self._edge_signature(edge_index, edge_weight, device)
+        if self._cached_adjacency is not None and self._cached_adjacency_signature == signature:
+            return self._cached_adjacency
+        adjacency = _to_dense_adjacency(edge_index, edge_weight, num_nodes, device)
+        self._cached_adjacency = adjacency
+        self._cached_adjacency_signature = signature
+        return adjacency
 
     def forward(
         self,
@@ -128,7 +153,7 @@ class STGCN(nn.Module):
         if nodes != self.num_nodes:
             raise ValueError(f"Input node count {nodes} does not match configured num_nodes={self.num_nodes}")
 
-        adjacency = _to_dense_adjacency(edge_index.to(x.device), edge_weight, nodes, x.device)
+        adjacency = self._get_cached_adjacency(edge_index, edge_weight, nodes, x.device)
 
         x = self.temporal_in(x)
         # Mix spatial structure independently at each time step.

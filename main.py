@@ -77,6 +77,19 @@ def _resolve_output_root() -> Path:
     return run_dir
 
 
+def _resolve_device(device_name: str = "auto") -> torch.device:
+    normalized = device_name.strip().lower()
+    if normalized == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if normalized == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available in this runtime.")
+        return torch.device("cuda")
+    if normalized == "cpu":
+        return torch.device("cpu")
+    return torch.device(device_name)
+
+
 def _stack_windows(
     signal_features: Sequence[np.ndarray],
     signal_targets: Sequence[np.ndarray],
@@ -535,11 +548,13 @@ def run_pipeline(
     benchmark_name: str = "Hanoi_CMH",
     max_scenarios: int = 20,
     epochs: int = 30,
-    window_batch_size: int = 8,
+    window_batch_size: int = 64,
     data_root: str | Path | None = None,
+    device: str = "auto",
 ) -> Dict[str, object]:
     raw_root = _resolve_raw_root(data_root)
     loader = LeakDBDatasetLoader(raw_root)
+    run_device = _resolve_device(device)
 
     available_scenarios = loader.list_scenarios(benchmark_name)
     scenario_bundles = loader.load_scenarios(
@@ -577,6 +592,9 @@ def run_pipeline(
         temporal_kernel_size=3,
         dropout=0.1,
     )
+    stgcn = stgcn.to(run_device)
+    if run_device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     model_device = next(stgcn.parameters()).device
     edge_index = torch.tensor(first_signal.edge_index, dtype=torch.long, device=model_device)
@@ -771,8 +789,9 @@ def main() -> None:
     parser.add_argument("--benchmark", default="Hanoi_CMH", help="LeakDB benchmark name, e.g. Hanoi_CMH")
     parser.add_argument("--max-scenarios", type=int, default=20, help="Maximum number of scenarios to train on")
     parser.add_argument("--epochs", type=int, default=30, help="Training epochs for the STGCN model")
-    parser.add_argument("--window-batch-size", type=int, default=8, help="Mini-batch size for sliding windows")
+    parser.add_argument("--window-batch-size", type=int, default=64, help="Mini-batch size for sliding windows")
     parser.add_argument("--data-root", default=None, help="Path to the dataset root or project data folder")
+    parser.add_argument("--device", default="auto", help="Training device: auto, cuda, cpu, or a torch device string")
     args = parser.parse_args()
 
     results = run_pipeline(
@@ -781,6 +800,7 @@ def main() -> None:
         epochs=args.epochs,
         window_batch_size=args.window_batch_size,
         data_root=args.data_root,
+        device=args.device,
     )
     LOGGER.info("Pipeline finished successfully: %s", results)
 
